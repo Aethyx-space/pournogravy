@@ -10,6 +10,7 @@
 
 import Stripe from "https://esm.sh/stripe@14.21.0?target=denonext";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { buildTaxLineItems } from "./helpers.ts";
 
 function corsHeaders(req: Request) {
   const origin = req.headers.get("origin") ?? "*";
@@ -109,11 +110,18 @@ Deno.serve(async (req) => {
 
     const stripe = new Stripe(stripeKey, { apiVersion: "2024-06-20" });
 
+    // One line per item with the clothing tax code, so Stripe can apply
+    // per-item rules like Rhode Island's $250 clothing exemption.
+    const { data: items, error: itemsError } = await supabase
+      .from("order_items")
+      .select("id, quantity, unit_price_cents")
+      .eq("order_id", orderId);
+    if (itemsError) throw itemsError;
+    if (!items || items.length === 0) throw new Error("Order has no items");
+
     const calc = await stripe.tax.calculations.create({
       currency: "usd",
-      line_items: [
-        { amount: subtotalAfterDiscount, reference: orderId, tax_behavior: "exclusive" },
-      ],
+      line_items: buildTaxLineItems(items, order.discount_cents ?? 0),
       shipping_cost: { amount: shippingCents },
       customer_details: {
         address: {
