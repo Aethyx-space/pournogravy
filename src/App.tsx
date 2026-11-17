@@ -33,6 +33,7 @@ const FAQ           = lazy(() => import("./pages/FAQ"));
 const Contact       = lazy(() => import("./pages/Contact"));
 const Proposal      = lazy(() => import("./pages/Proposal"));
 const Login         = lazy(() => import("./pages/Login"));
+const ResetPassword = lazy(() => import("./pages/ResetPassword"));
 const Account       = lazy(() => import("./pages/Account"));
 const Checkout      = lazy(() => import("./pages/Checkout"));
 const CheckoutReturn= lazy(() => import("./pages/CheckoutReturn"));
@@ -149,6 +150,7 @@ const App = () => (
                     <Route path="/contact"         element={<Contact />} />
                     <Route path="/proposal"        element={<Proposal />} />
                     <Route path="/login"           element={<Login />} />
+                    <Route path="/reset-password"  element={<ResetPassword />} />
                     <Route path="/account"         element={<Account />} />
                     <Route path="/wishlist"        element={<Wishlist />} />
                     <Route path="/rewards"         element={<Rewards />} />
