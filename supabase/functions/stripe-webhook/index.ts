@@ -1,4 +1,6 @@
 // Stripe webhook handler.
+// Flow: verify signature -> claim the order (pending -> paid, exactly once) ->
+// return 200 to Stripe -> emails + printer job run in the background.
 // Processes `checkout.session.completed` to mark the corresponding order
 // as paid, save the shipping address + payment intent, then queues a
 // confirmation email and routes the order to fulfillment (printer email or POD).
@@ -12,7 +14,14 @@
 // and select the `checkout.session.completed` event.
 
 import Stripe from "https://esm.sh/stripe@14.21.0?target=denonext";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import {
+  CLAIMABLE_STATUSES,
+  customerDisplayName,
+  memoizeSigner,
+  resolveCustomerEmail,
+  runInBackground,
+} from "./helpers.ts";
 
 // Generate HMAC-SHA256 token for printer tracking link
 async function generateFulfillmentToken(orderId: string, secret: string): Promise<string> {
@@ -157,6 +166,7 @@ Deno.serve(async (req) => {
   let amountTotal: number | undefined;
   let paymentIntentId: string | undefined;
   let shippingCents = 0;
+  let stripeEmail: string | null = null;
 
   if (event.type === "payment_intent.succeeded") {
     const pi = event.data.object as Stripe.PaymentIntent;
@@ -165,6 +175,7 @@ Deno.serve(async (req) => {
     amountTotal = pi.amount_received;
     paymentIntentId = pi.id;
     shippingCents = Number(pi.metadata?.shipping_cents ?? 0);
+    stripeEmail = pi.receipt_email ?? null;
   } else if (event.type === "checkout.session.completed") {
     const session = event.data.object as Stripe.Checkout.Session;
     orderId = session.metadata?.order_id;
@@ -174,11 +185,16 @@ Deno.serve(async (req) => {
     paymentIntentId = typeof session.payment_intent === "string"
       ? session.payment_intent
       : session.payment_intent?.id;
+    stripeEmail = session.customer_details?.email ?? session.customer_email ?? null;
   }
 
   if (orderId) {
-    // Mark order paid — outside try-catch; returns {data,error}, never throws
-    await supabase
+    // FIX 1 (idempotency): claim the order. The update only matches while the
+    // order is still unpaid, so a Stripe retry, a duplicate delivery, or both
+    // event types firing for one order can no longer re-send emails, re-queue
+    // the printer, double-award Pour Points, or knock a shipped/refunded order
+    // back to "paid". Exactly one delivery wins the claim.
+    const { data: claimed, error: claimErr } = await supabase
       .from("orders")
       .update({
         status: "paid",
@@ -187,10 +203,53 @@ Deno.serve(async (req) => {
         ...(amountTotal != null ? { total_cents: amountTotal } : {}),
         shipping_cents: shippingCents,
       })
-      .eq("id", orderId);
+      .eq("id", orderId)
+      .in("status", [...CLAIMABLE_STATUSES])
+      .select("id")
+      .maybeSingle();
 
-    try {
+    if (claimErr) {
+      // Database hiccup: nothing was claimed, so let Stripe retry later.
+      console.error("[stripe-webhook] claim failed, asking Stripe to retry", {
+        orderId, eventId: event.id, error: claimErr,
+      });
+      return new Response("claim failed", { status: 500 });
+    }
 
+    if (!claimed) {
+      console.log("[stripe-webhook] order already processed or not pending, skipping", {
+        orderId, eventId: event.id, eventType: event.type,
+      });
+    } else {
+      // FIX 2 (timeouts): the fulfillment work (emails, signed URLs, printer)
+      // runs after the 200 goes back to Stripe, so slow sends can no longer
+      // make Stripe time out and retry.
+      const mode = await runInBackground(
+        processPaidOrder(supabase, stripe, orderId, shippingCents, stripeEmail, event),
+        (globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }).EdgeRuntime,
+      );
+      console.log("[stripe-webhook] order claimed", { orderId, eventId: event.id, mode });
+    }
+  } // end if (orderId)
+
+  return new Response(JSON.stringify({ received: true }), {
+    headers: { "Content-Type": "application/json" },
+  });
+});
+
+// Everything that happens after an order is marked paid. Runs at most once per
+// order (see the claim above). Never throws: errors are logged so they show in
+// the Supabase function logs as [stripe-webhook] PROCESSING ERROR.
+async function processPaidOrder(
+  // deno-lint-ignore no-explicit-any
+  supabase: SupabaseClient<any, "public", any>,
+  stripe: Stripe,
+  orderId: string,
+  shippingCents: number,
+  stripeEmail: string | null,
+  event: Stripe.Event,
+): Promise<void> {
+  try {
     // Fetch order + items + settings to build the notifications/printer payload
     const [{ data: order }, { data: items }, { data: settings }, { data: loyaltyRules }] = await Promise.all([
       supabase.from("orders").select("*").eq("id", orderId).single(),
@@ -214,8 +273,25 @@ Deno.serve(async (req) => {
 
     if (!order) {
       console.error("[stripe-webhook] order re-fetch null", { orderId });
-      return new Response("ok", { status: 200 });
+      return;
     }
+
+    // FIX 4 (missing email): an order saved without an email used to crash on
+    // order.email.split() before any email or printer job went out. Fall back to
+    // the email Stripe collected, save it on the order, and if there is still
+    // none, skip only the customer email and keep fulfilling.
+    const customerEmail = resolveCustomerEmail(order.email, stripeEmail);
+    if (customerEmail && !order.email) {
+      const { error: emailErr } = await supabase
+        .from("orders").update({ email: customerEmail }).eq("id", order.id).is("email", null);
+      if (emailErr) console.error("[stripe-webhook] email backfill failed", { orderId: order.id, error: emailErr });
+      order.email = customerEmail;
+    }
+    if (!customerEmail) {
+      console.error("[stripe-webhook] order has no customer email; customer confirmation skipped", { orderId: order.id });
+    }
+    const shipNameForEmail = ((order.shipping_address as Record<string, unknown> | null)?.name as string) ?? "";
+    const customerName = customerDisplayName(customerEmail, shipNameForEmail);
 
     // Record the Stripe tax transaction (Task 16). No-op when tax was off
     // for this order (no stripe_tax_calculation_id). Idempotent for webhook
@@ -238,14 +314,17 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Write purchase analytics event (fire-and-forget — don't block fulfillment)
-    supabase.from("analytics_events").insert({
+    // Write purchase analytics event. Supabase query builders have no .catch(),
+    // so the old `.insert(...).catch(() => {})` threw "catch is not a function"
+    // here on every order, which aborted everything below (no emails, no printer).
+    const { error: analyticsErr } = await supabase.from("analytics_events").insert({
       event_type: "purchase",
       order_id: order.id,
       revenue: ((order.total_cents ?? 0) - (order.shipping_cents ?? 0)) / 100,
       session_id: order.stripe_session_id ?? order.id,
       created_at: new Date().toISOString(),
-    }).catch(() => {});
+    });
+    if (analyticsErr) console.error("[stripe-webhook] analytics insert failed", { orderId: order.id, error: analyticsErr });
 
     const itemsList = (items ?? [])
       .map((it) => {
@@ -260,10 +339,10 @@ Deno.serve(async (req) => {
     const shippingCostForEmail = shippingCents > 0 ? `$${(shippingCents / 100).toFixed(2)}` : 'TBD';
 
     // 1) Customer confirmation
-    await supabase.from("notifications").insert([{
+    if (customerEmail) await supabase.from("notifications").insert([{
       type: "email",
       template_key: "order_confirmation",
-      recipient: order.email,
+      recipient: customerEmail,
       subject: "",
       body_html: "",
       body_text: "",
@@ -283,9 +362,10 @@ Deno.serve(async (req) => {
     const TEST_RECIPIENTS = ["kmitch2087@gmail.com", "aopie91@gmail.com"];
     const confirmationRecipients: string[] = order.is_test
       ? TEST_RECIPIENTS
-      : [order.email];
+      : customerEmail ? [customerEmail] : [];
 
-    for (const recipient of confirmationRecipients) {
+    // FIX 3a: send in parallel instead of one after another.
+    await Promise.all(confirmationRecipients.map(async (recipient) => {
       const { error: confirmErr } = await supabase.functions.invoke("send-notification", {
         body: {
           templateKey: "order_confirmation",
@@ -293,7 +373,7 @@ Deno.serve(async (req) => {
           relatedKind: "order",
           relatedId: order.id,
           variables: {
-            customer_name: order.is_test ? "TEST ORDER" : order.email.split("@")[0],
+            customer_name: order.is_test ? "TEST ORDER" : customerName,
             order_number: order.id.slice(0, 8).toUpperCase(),
             order_items: itemsList,
             order_subtotal: orderSubtotal,
@@ -304,7 +384,7 @@ Deno.serve(async (req) => {
         },
       });
       if (confirmErr) console.error("[stripe-webhook] order_confirmation send failed", { recipient, error: confirmErr });
-    }
+    }));
 
     // 2) Pour Points — 1 point per $1 spent on products only (auth users only; shipping excluded; program enabled)
     if (order.user_id && (order.total_cents ?? 0) > 0 && (loyaltyRules?.pour_points_enabled ?? false)) {
@@ -384,18 +464,21 @@ Deno.serve(async (req) => {
       // printer can open the artwork straight from the order email. Falls back to the
       // public path if signing fails (keeps working if the bucket is still public).
       const SIGN_TTL = 31_536_000; // 1 year
-      const signPath = async (p: string): Promise<string> => {
+      // FIX 3b: memoized, so each file is signed once per order. Before, the back
+      // logo was re-signed for every item and every front file twice (links + CSV).
+      const signPath = memoizeSigner(async (p: string): Promise<string> => {
         try {
           const { data } = await supabase.storage.from("print-files").createSignedUrl(p, SIGN_TTL);
           return data?.signedUrl ?? `${STORAGE_BASE}/${p}`;
         } catch {
           return `${STORAGE_BASE}/${p}`;
         }
-      };
+      });
 
-      // Build design links list (one per unique slug) for printer email
+      // Build design links list (one per unique slug) for printer email.
+      // Slugs are collected first, then all signed in parallel; output order is unchanged.
       const seenSlugs = new Set<string>();
-      const designLinkLines: string[] = [];
+      const designLinkJobs: Promise<string>[] = [];
       for (const it of (items ?? [])) {
         const s = (it.product_snapshot ?? {}) as Record<string, unknown>;
         const slug = String(s.slug ?? "");
@@ -411,20 +494,19 @@ Deno.serve(async (req) => {
           seenSlugs.add(slug);
           const garmentColor = String(s.color ?? "");
           const printBase = printBaseFor(slug);
-          const [frontBlack, frontWhite, backUrl] = await Promise.all([
+          designLinkJobs.push(Promise.all([
             signPath(`black/${printBase}_black.png`),
             signPath(`white/${printBase}_white.png`),
             signPath(backLogoPath(garmentColor)),
-          ]);
-          designLinkLines.push(
+          ]).then(([frontBlack, frontWhite, backUrl]) =>
             `${slug} (${garmentColor || "color unknown"}) — TWO-SIDED:\n` +
             `  Front Black Ink: ${frontBlack}\n` +
             `  Front White Ink: ${frontWhite}\n` +
             `  Back (auto-matched to garment color): ${backUrl}`
-          );
+          ));
         }
       }
-      const designLinks = designLinkLines.join("\n\n");
+      const designLinks = (await Promise.all(designLinkJobs)).join("\n\n");
 
       // Build fulfillment CSV
       const ship = order.shipping_address as Record<string, unknown> | null;
@@ -515,8 +597,8 @@ Deno.serve(async (req) => {
 
       const printerVars = {
         order_number: shortId,
-        customer_name: order.email.split("@")[0],
-        customer_email: order.email,
+        customer_name: customerName,
+        customer_email: customerEmail ?? "(no email on file)",
         order_items: itemsList,
         shipping_address: addr,
         tracking_submit_url: trackingSubmitUrl,
@@ -528,15 +610,29 @@ Deno.serve(async (req) => {
         action_links: actionLinks,
       };
 
-      const { error: printerErr } = await supabase.functions.invoke("send-notification", {
+      // FIX 3c: printer email and both CCs go out in parallel, not one by one.
+      const sendPrinterEmail = (recipient: string) => supabase.functions.invoke("send-notification", {
         body: {
           templateKey: "printer_notification",
-          recipient: settings.printer_email,
+          recipient,
           relatedKind: "order",
           relatedId: order.id,
           variables: printerVars,
           attachments: [{ filename: `order-${shortId}.csv`, content: csvBase64 }],
         },
+      });
+      // CC both Kristin and Opie on every printer notification
+      const PRINTER_CCS = ["kmitch2087@gmail.com", "aopie91@gmail.com"];
+      const [printerResult, ...ccResults] = await Promise.allSettled([
+        sendPrinterEmail(settings.printer_email),
+        ...PRINTER_CCS.map(sendPrinterEmail),
+      ]);
+      const printerErr = printerResult.status === "rejected"
+        ? printerResult.reason
+        : printerResult.value?.error;
+      ccResults.forEach((r, i) => {
+        const err = r.status === "rejected" ? r.reason : r.value?.error;
+        if (err) console.error("[stripe-webhook] printer CC send failed", { orderId: order.id, cc: PRINTER_CCS[i], error: err });
       });
       if (printerErr) {
         console.error("[stripe-webhook] printer_notification send failed", { orderId: order.id, error: printerErr });
@@ -552,35 +648,14 @@ Deno.serve(async (req) => {
           body_text: "",
         });
       }
-
-      // CC both Kristin and Opie on every printer notification
-      for (const cc of ["kmitch2087@gmail.com", "aopie91@gmail.com"]) {
-        await supabase.functions.invoke("send-notification", {
-          body: {
-            templateKey: "printer_notification",
-            recipient: cc,
-            relatedKind: "order",
-            relatedId: order.id,
-            variables: printerVars,
-            attachments: [{ filename: `order-${shortId}.csv`, content: csvBase64 }],
-          },
-        });
-      }
     }
-    } catch (processingErr) {
-      // Log the actual error so we can see it in Supabase edge function logs,
-      // then return 200 to stop Stripe retrying — order is already marked paid.
-      console.error("[stripe-webhook] PROCESSING ERROR", {
-        orderId,
-        eventType: event.type,
-        error: processingErr instanceof Error ? processingErr.message : String(processingErr),
-        stack: processingErr instanceof Error ? processingErr.stack : undefined,
-      });
-    }
-
-  } // end if (orderId)
-
-  return new Response(JSON.stringify({ received: true }), {
-    headers: { "Content-Type": "application/json" },
-  });
-});
+  } catch (processingErr) {
+    console.error("[stripe-webhook] PROCESSING ERROR", {
+      orderId,
+      eventId: event.id,
+      eventType: event.type,
+      error: processingErr instanceof Error ? processingErr.message : String(processingErr),
+      stack: processingErr instanceof Error ? processingErr.stack : undefined,
+    });
+  }
+}
